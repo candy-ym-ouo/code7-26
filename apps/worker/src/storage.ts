@@ -3,6 +3,7 @@ import {
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client
 } from "@aws-sdk/client-s3";
@@ -44,7 +45,9 @@ export async function copyToPublic(processedKey: string, publicKey: string): Pro
     Bucket: config.S3_PUBLIC_BUCKET,
     Key: publicKey,
     CopySource: `${config.S3_QUARANTINE_BUCKET}/${processedKey}`,
-    MetadataDirective: "COPY"
+    MetadataDirective: "REPLACE",
+    ContentType: "image/webp",
+    CacheControl: "public, max-age=31536000, immutable"
   }));
 }
 
@@ -59,4 +62,37 @@ export async function objectExists(bucket: string, key: string): Promise<boolean
 
 export async function deleteObject(bucket: string, key: string): Promise<void> {
   await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+}
+
+export type ListedObject = {
+  key: string;
+  size: number;
+  lastModified: Date | null;
+};
+
+/**
+ * 分页列举桶内对象。stopAfter 给出本次对账允许扫描的对象数上限；
+ * 返回 nextContinuationToken 供下一个维护周期续扫，避免大桶单次扫爆。
+ */
+export async function listObjects(
+  bucket: string,
+  continuationToken: string | null,
+  options: { maxKeys?: number; prefix?: string } = {}
+): Promise<{ objects: ListedObject[]; nextContinuationToken: string | null }> {
+  const response = await s3.send(new ListObjectsV2Command({
+    Bucket: bucket,
+    MaxKeys: options.maxKeys ?? 200,
+    Prefix: options.prefix,
+    ContinuationToken: continuationToken ?? undefined
+  }));
+  return {
+    objects: (response.Contents ?? []).flatMap((item) =>
+      item.Key
+        ? [{ key: item.Key, size: item.Size ?? 0, lastModified: item.LastModified ?? null }]
+        : []
+    ),
+    nextContinuationToken: response.IsTruncated && response.NextContinuationToken
+      ? response.NextContinuationToken
+      : null
+  };
 }

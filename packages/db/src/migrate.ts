@@ -15,6 +15,12 @@ async function main() {
   const client = new Client({ connectionString: databaseUrl });
   await client.connect();
   try {
+    // 0003 回填媒体对象台账时需要桶名；通过会话参数传入，缺省值与 infra/minio 保持一致。
+    await client.query(
+      "SELECT set_config('app.s3_quarantine_bucket', $1, false), set_config('app.s3_public_bucket', $2, false)",
+      [process.env.S3_QUARANTINE_BUCKET || "map-quarantine", process.env.S3_PUBLIC_BUCKET || "map-public"]
+    );
+
     await client.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         filename text PRIMARY KEY,

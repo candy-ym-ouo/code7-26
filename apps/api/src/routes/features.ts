@@ -5,9 +5,9 @@ import { createFeatureSchema } from "@map/shared/contracts";
 import { query, transaction } from "../db";
 import { AppError, conflict, forbidden, notFound } from "../errors";
 import { optionalAuth, requireAuth, requireVerifiedContributor } from "../auth";
-import { deleteObject, publicMediaUrl } from "../storage";
-import { config } from "../config";
+import { publicMediaUrl } from "../storage";
 import { recordAudit } from "../audit";
+import { deleteLedgerObjectsForMedia } from "../ledger";
 
 type MediaRow = {
   id: string;
@@ -390,7 +390,7 @@ export async function featureRoutes(app: FastifyInstance) {
 
   app.delete("/features/:id", { preHandler: requireAuth }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
-    const media = await transaction(async (client) => {
+    const mediaIds = await transaction(async (client) => {
       const result = await client.query<{ owner_id: string }>(
         "SELECT owner_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         [params.id]
@@ -400,16 +400,8 @@ export async function featureRoutes(app: FastifyInstance) {
       const canDelete = row.owner_id === request.user!.id || ["moderator", "admin"].includes(request.user!.role);
       if (!canDelete) throw forbidden();
 
-      const mediaResult = await client.query<{
-        id: string;
-        quarantine_object_key: string;
-        processed_object_key: string | null;
-        thumbnail_object_key: string | null;
-        public_object_key: string | null;
-        public_thumbnail_object_key: string | null;
-      }>(
-        `SELECT DISTINCT ma.id, ma.quarantine_object_key, ma.processed_object_key,
-                ma.thumbnail_object_key, ma.public_object_key, ma.public_thumbnail_object_key
+      const mediaResult = await client.query<{ id: string }>(
+        `SELECT DISTINCT ma.id
          FROM revision_media rm
          JOIN feature_revisions fr ON fr.id = rm.revision_id
          JOIN media_assets ma ON ma.id = rm.media_id
@@ -435,17 +427,14 @@ export async function featureRoutes(app: FastifyInstance) {
         resourceId: params.id,
         metadata: { mediaCount: mediaResult.rowCount }
       });
-      return mediaResult.rows;
+      return mediaResult.rows.map((item) => item.id);
     });
 
-    const removals = media.flatMap((item) => [
-      deleteObject(config.S3_QUARANTINE_BUCKET, item.quarantine_object_key),
-      item.processed_object_key ? deleteObject(config.S3_QUARANTINE_BUCKET, item.processed_object_key) : Promise.resolve(),
-      item.thumbnail_object_key ? deleteObject(config.S3_QUARANTINE_BUCKET, item.thumbnail_object_key) : Promise.resolve(),
-      item.public_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, item.public_object_key) : Promise.resolve(),
-      item.public_thumbnail_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, item.public_thumbnail_object_key) : Promise.resolve()
-    ]);
-    await Promise.allSettled(removals);
+    // 台账驱动删除：当前引用对象与中断尝试的半成品残留一并清理，删除失败由 worker 对账重试。
+    const { failed } = await deleteLedgerObjectsForMedia(mediaIds, { origin: "pipeline" });
+    if (failed.length) {
+      console.error({ featureId: params.id, failed }, "some feature media objects failed to delete; reconcile will retry");
+    }
     return { status: "deleted" };
   });
 

@@ -2,8 +2,13 @@ import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { mediaUploadCompleteSchema, mediaUploadInitSchema } from "@map/shared/contracts";
+import {
+  publicImageKey,
+  publicThumbnailKey,
+  quarantineOriginalKey
+} from "@map/shared/media-keys";
 import { config } from "../config";
-import { query, transaction } from "../db";
+import { pool, query, transaction } from "../db";
 import { AppError, conflict, forbidden, notFound } from "../errors";
 import { requireAuth, requireModerator, requireVerifiedContributor } from "../auth";
 import {
@@ -16,6 +21,12 @@ import {
 } from "../storage";
 import { enqueueMediaProcessing } from "../queue";
 import { recordAudit } from "../audit";
+import {
+  deleteLedgerObjectsForMedia,
+  markLedgerObjectDeleted,
+  markLedgerObjectPendingDeletion,
+  recordMediaObject
+} from "../ledger";
 
 function extensionForMime(mime: string) {
   if (mime === "image/jpeg") return "jpg";
@@ -52,12 +63,21 @@ export async function mediaRoutes(app: FastifyInstance) {
       throw new AppError(400, "VALIDATION_FAILED", `File exceeds ${config.MEDIA_MAX_BYTES} bytes`);
     }
     const id = randomUUID();
-    const key = `quarantine/${request.user!.id}/${id}.${extensionForMime(input.mimeType)}`;
+    const extension = extensionForMime(input.mimeType);
+    const key = quarantineOriginalKey(request.user!.id, id, extension);
     await query(
       `INSERT INTO media_assets(id, owner_id, original_filename, mime_type, byte_size, quarantine_object_key)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [id, request.user!.id, input.filename, input.mimeType, input.byteSize, key]
     );
+    // 原图由浏览器直传；先登记预期对象，complete 时会用 HEAD 校验它确实存在。
+    await recordMediaObject(pool, {
+      mediaId: id,
+      bucket: config.S3_QUARANTINE_BUCKET,
+      objectKey: key,
+      role: "quarantine_original",
+      note: "browser direct upload (pending object confirmation)"
+    });
     const uploadUrl = await createUploadUrl(key, input.mimeType);
     return reply.code(201).send({ id, uploadUrl, expiresInSeconds: 600 });
   });
@@ -112,6 +132,7 @@ export async function mediaRoutes(app: FastifyInstance) {
           detector: "pending"
         })]
       );
+      // 处理尝试行由 worker 认领任务时创建，避免任务从未被消费时留下悬空 running 记录。
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "media.processing_requested",
@@ -122,7 +143,10 @@ export async function mediaRoutes(app: FastifyInstance) {
     });
 
     try {
-      await enqueueMediaProcessing(params.id, `media-${params.id}`);
+      await enqueueMediaProcessing(
+        { mediaId: params.id, trigger: "initial", queuedBy: request.user!.id },
+        `media-${params.id}`
+      );
     } catch (error) {
       await query(
         "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
@@ -161,9 +185,21 @@ export async function mediaRoutes(app: FastifyInstance) {
     if (!row) throw notFound("Media not found");
     if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
     if (!["failed", "rejected"].includes(row.privacy_status)) throw conflict("Only failed media can be retried");
-    await query("UPDATE media_assets SET privacy_status = 'processing', failure_code = NULL, updated_at = now() WHERE id = $1", [params.id]);
+
+    // 重试只翻转状态并重新入队；尝试历史由 worker 认领时按 trigger='retry' 落库，
+    // 新尝试产物使用独立对象键，不会覆盖旧产物，台账可完整追溯每次重试。
+    const updated = await query(
+      `UPDATE media_assets SET privacy_status = 'processing', failure_code = NULL, updated_at = now()
+       WHERE id = $1 AND privacy_status IN ('failed', 'rejected') AND deleted_at IS NULL
+       RETURNING id`,
+      [params.id]
+    );
+    if (!updated.rows[0]) throw conflict("Only failed media can be retried");
     try {
-      await enqueueMediaProcessing(params.id, `media-${params.id}-${Date.now()}`);
+      await enqueueMediaProcessing(
+        { mediaId: params.id, trigger: "retry", queuedBy: request.user!.id },
+        `media-${params.id}-${Date.now()}`
+      );
     } catch (error) {
       await query(
         "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
@@ -216,13 +252,36 @@ export async function mediaRoutes(app: FastifyInstance) {
       throw conflict("Media is not waiting for manual privacy approval");
     }
 
-    const publicKey = `media/${params.id}.webp`;
-    const thumbnailKey = `media/${params.id}.thumb.webp`;
+    const publicKey = publicImageKey(params.id);
+    const thumbnailKey = publicThumbnailKey(params.id);
     try {
       await publishMediaObject(media.processed_object_key, publicKey);
-      if (media.thumbnail_object_key) await publishMediaObject(media.thumbnail_object_key, thumbnailKey);
+      await recordMediaObject(pool, {
+        mediaId: params.id,
+        bucket: config.S3_PUBLIC_BUCKET,
+        objectKey: publicKey,
+        role: "public_image",
+        note: "published after privacy review"
+      });
+      if (media.thumbnail_object_key) {
+        await publishMediaObject(media.thumbnail_object_key, thumbnailKey);
+        await recordMediaObject(pool, {
+          mediaId: params.id,
+          bucket: config.S3_PUBLIC_BUCKET,
+          objectKey: thumbnailKey,
+          role: "public_thumbnail",
+          note: "published after privacy review"
+        });
+      }
 
       await transaction(async (client) => {
+        const statusResult = await client.query<{ privacy_status: string }>(
+          "SELECT privacy_status FROM media_assets WHERE id = $1 FOR UPDATE",
+          [params.id]
+        );
+        if (statusResult.rows[0]?.privacy_status !== "manual_review") {
+          throw conflict("Media is not waiting for manual privacy approval");
+        }
         await client.query(
           `UPDATE media_assets
            SET privacy_status = 'ready', public_object_key = $2,
@@ -238,10 +297,32 @@ export async function mediaRoutes(app: FastifyInstance) {
         });
       });
     } catch (error) {
-      await Promise.allSettled([
-        deleteObject(config.S3_PUBLIC_BUCKET, publicKey),
-        media.thumbnail_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, thumbnailKey) : Promise.resolve()
-      ]);
+      // 发布失败：公开桶中可能已有副本。按隐私优先立即尝试物理删除；删除失败则把
+      // 对象置为短宽限删除（worker 对账会在 15 分钟内强制清理），绝不只落墓碑而放任对象滞留。
+      await Promise.allSettled(
+        [
+          { key: publicKey, role: "public_image" as const },
+          ...(media.thumbnail_object_key ? [{ key: thumbnailKey, role: "public_thumbnail" as const }] : [])
+        ].map(async ({ key, role }) => {
+          try {
+            await deleteObject(config.S3_PUBLIC_BUCKET, key);
+            await markLedgerObjectDeleted(pool, config.S3_PUBLIC_BUCKET, key, {
+              mediaId: params.id,
+              role,
+              note: "removed after aborted privacy approval"
+            });
+          } catch (deleteError) {
+            console.error({ mediaId: params.id, key, deleteError }, "failed to remove public object after aborted approval; short grace deletion scheduled");
+            await markLedgerObjectPendingDeletion(
+              pool,
+              config.S3_PUBLIC_BUCKET,
+              key,
+              new Date(Date.now() + 15 * 60 * 1000),
+              { mediaId: params.id, role, note: "privacy approval aborted and delete failed" }
+            );
+          }
+        })
+      );
       throw error;
     }
 
@@ -253,14 +334,8 @@ export async function mediaRoutes(app: FastifyInstance) {
     const result = await query<{
       id: string;
       owner_id: string;
-      quarantine_object_key: string;
-      processed_object_key: string | null;
-      thumbnail_object_key: string | null;
-      public_object_key: string | null;
-      public_thumbnail_object_key: string | null;
     }>(
-      `SELECT id, owner_id, quarantine_object_key, processed_object_key, thumbnail_object_key,
-              public_object_key, public_thumbnail_object_key
+      `SELECT id, owner_id
        FROM media_assets WHERE id = $1 AND deleted_at IS NULL`,
       [params.id]
     );
@@ -293,14 +368,12 @@ export async function mediaRoutes(app: FastifyInstance) {
       });
     });
 
-    const removals = [
-      deleteObject(config.S3_QUARANTINE_BUCKET, media.quarantine_object_key),
-      media.processed_object_key ? deleteObject(config.S3_QUARANTINE_BUCKET, media.processed_object_key) : Promise.resolve(),
-      media.public_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, media.public_object_key) : Promise.resolve(),
-      media.public_thumbnail_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, media.public_thumbnail_object_key) : Promise.resolve(),
-      media.thumbnail_object_key ? deleteObject(config.S3_QUARANTINE_BUCKET, media.thumbnail_object_key) : Promise.resolve()
-    ];
-    await Promise.allSettled(removals);
+    // 台账驱动删除：除当前引用的对象外，中断尝试写入的半成品/历史产物也会被清掉。
+    const { failed } = await deleteLedgerObjectsForMedia(params.id, { origin: "pipeline" });
+    if (failed.length) {
+      console.error({ mediaId: params.id, failed }, "some media objects failed to delete; reconcile will retry");
+    }
     return { status: "deleted" };
   });
 }
+

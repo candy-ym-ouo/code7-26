@@ -20,9 +20,15 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   ]);
 }
 
-export async function enqueueMediaProcessing(mediaId: string, jobId: string): Promise<void> {
+export type MediaProcessingPayload = {
+  mediaId: string;
+  trigger: "initial" | "retry" | "recovery";
+  queuedBy?: string | null;
+};
+
+export async function enqueueMediaProcessing(payload: MediaProcessingPayload, jobId: string): Promise<void> {
   await withTimeout(
-    mediaQueue.add("process", { mediaId }, {
+    mediaQueue.add("process", payload, {
       jobId,
       removeOnComplete: 1000,
       removeOnFail: 1000

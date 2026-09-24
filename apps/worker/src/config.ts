@@ -21,6 +21,13 @@ const envSchema = z.object({
   PRIVACY_BLUR_SIGMA: z.coerce.number().positive().default(32),
   PRIVACY_BLUR_PADDING: z.coerce.number().min(0).max(0.5).default(0.08),
   ORIGINAL_RETENTION_HOURS: z.coerce.number().positive().default(24),
+  // 无法归属的私有桶孤儿对象宽限期：给人工排查/引用重建留时间，到期后物理删除。
+  ORPHAN_QUARANTINE_GRACE_HOURS: z.coerce.number().positive().default(72),
+  // 公开桶中的无台账对象按隐私优先原则处理：短宽限期后立即删除（未审核内容不得滞留公开桶）。
+  ORPHAN_PUBLIC_GRACE_MINUTES: z.coerce.number().positive().default(15),
+  // 单次维护 tick 最多对账的对象数，限制扫描与删除压力。
+  RECONCILE_BATCH_SIZE: z.coerce.number().int().positive().default(200),
+  WORKER_ID: z.string().optional(),
   CLAMAV_ENABLED: z.string().default("true").transform((value) => value === "true"),
   CLAMAV_HOST: z.string().default("localhost"),
   CLAMAV_PORT: z.coerce.number().int().positive().default(3310),

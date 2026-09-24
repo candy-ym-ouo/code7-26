@@ -2,7 +2,16 @@ import { Queue, Worker } from "bullmq";
 import IORedis from "ioredis";
 import { config } from "./config";
 import { pool } from "./db";
-import { processMediaJob, cleanupOriginalMedia, cleanupDeletedMediaObjects, markStaleFeatures, recoverStuckMedia, markUnreferencedMediaDeleted } from "./media-job";
+import {
+  processMediaJob,
+  cleanupOriginalMedia,
+  cleanupDeletedMediaObjects,
+  markStaleFeatures,
+  recoverStuckMedia,
+  markUnreferencedMediaDeleted,
+  reconcileMediaObjects,
+  type MediaJobData
+} from "./media-job";
 import { dispatchOutbox, recoverStuckOutbox } from "./outbox";
 import { purgeDeletedAccounts } from "./account-job";
 
@@ -22,7 +31,13 @@ const mediaQueue = new Queue("media", { connection: queueConnection });
 
 const mediaWorker = new Worker("media", async (job) => {
   if (job.name !== "process") return;
-  await processMediaJob(String(job.data.mediaId));
+  const data = (job.data ?? {}) as Partial<MediaJobData>;
+  await processMediaJob(
+    data.mediaId ? String(data.mediaId) : "",
+    data.trigger ?? "initial",
+    data.queuedBy ? String(data.queuedBy) : null,
+    job.id ? String(job.id) : null
+  );
 }, { connection: mediaWorkerConnection, concurrency: 2 });
 
 const outboxWorker = new Worker("outbox", async (job) => {
@@ -52,7 +67,7 @@ async function maintenanceTick() {
     await dispatchOutbox();
     const stuckMedia = await recoverStuckMedia();
     for (const mediaId of stuckMedia) {
-      await withTimeout(mediaQueue.add("process", { mediaId }, {
+      await withTimeout(mediaQueue.add("process", { mediaId, trigger: "recovery" } satisfies MediaJobData, {
         jobId: `media-recover-${mediaId}-${Date.now()}`,
         removeOnComplete: 1000,
         removeOnFail: 1000
@@ -61,6 +76,8 @@ async function maintenanceTick() {
     await cleanupOriginalMedia();
     await markUnreferencedMediaDeleted();
     await cleanupDeletedMediaObjects();
+    // 对象存储对账放在删除收口之后：先让台账驱动的删除落地，再扫桶重建引用/登记孤儿。
+    await reconcileMediaObjects();
     await markStaleFeatures();
     await purgeDeletedAccounts();
   } catch (error) {

@@ -1,7 +1,6 @@
-import { config } from "./config";
 import { pool } from "./db";
-import { deleteObject } from "./storage";
 import { randomToken } from "@map/shared/server";
+import { deleteAllMediaObjects } from "./media-job";
 
 type DeletableAccount = { id: string };
 
@@ -14,34 +13,22 @@ export async function purgeDeletedAccounts(): Promise<void> {
   );
 
   for (const account of accounts.rows) {
-    const media = await pool.query<{
-      quarantine_object_key: string;
-      processed_object_key: string | null;
-      thumbnail_object_key: string | null;
-      public_object_key: string | null;
-      public_thumbnail_object_key: string | null;
-    }>(
-      `SELECT quarantine_object_key, processed_object_key, thumbnail_object_key,
-              public_object_key, public_thumbnail_object_key
-       FROM media_assets WHERE owner_id = $1`,
+    const mediaIds = await pool.query<{ id: string }>(
+      "SELECT id FROM media_assets WHERE owner_id = $1",
       [account.id]
     );
 
-    try {
-      for (const item of media.rows) {
-        const removals = [
-          deleteObject(config.S3_QUARANTINE_BUCKET, item.quarantine_object_key),
-          item.processed_object_key ? deleteObject(config.S3_QUARANTINE_BUCKET, item.processed_object_key) : Promise.resolve(),
-          item.thumbnail_object_key ? deleteObject(config.S3_QUARANTINE_BUCKET, item.thumbnail_object_key) : Promise.resolve(),
-          item.public_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, item.public_object_key) : Promise.resolve(),
-          item.public_thumbnail_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, item.public_thumbnail_object_key) : Promise.resolve()
-        ];
-        await Promise.all(removals);
+    // 台账驱动删除：处理尝试的半成品与历史残留也在删除范围内，
+    // 任一对象删除失败则跳过本账号，下个维护周期重试，避免留下孤儿。
+    let hadFailure = false;
+    for (const media of mediaIds.rows) {
+      const { failed } = await deleteAllMediaObjects(media.id, "pipeline");
+      if (failed.length > 0) {
+        hadFailure = true;
+        console.error({ userId: account.id, mediaId: media.id, failed }, "account purge object deletion failed; will retry");
       }
-    } catch (error) {
-      console.error({ userId: account.id, error }, "account purge object deletion failed; will retry");
-      continue;
     }
+    if (hadFailure) continue;
 
     const client = await pool.connect();
     try {
