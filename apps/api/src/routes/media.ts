@@ -3,7 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { mediaUploadCompleteSchema, mediaUploadInitSchema } from "@map/shared/contracts";
 import { config } from "../config";
-import { query, transaction } from "../db";
+import { pool, query, transaction } from "../db";
 import { AppError, conflict, forbidden, notFound } from "../errors";
 import { requireAuth, requireModerator, requireVerifiedContributor } from "../auth";
 import {
@@ -15,7 +15,7 @@ import {
   publicMediaUrl
 } from "../storage";
 import { enqueueMediaProcessing } from "../queue";
-import { recordAudit } from "../audit";
+import { recordAudit, recordMediaObjectEvent } from "../audit";
 
 function extensionForMime(mime: string) {
   if (mime === "image/jpeg") return "jpg";
@@ -112,6 +112,15 @@ export async function mediaRoutes(app: FastifyInstance) {
           detector: "pending"
         })]
       );
+      await recordMediaObjectEvent(client, {
+        mediaId: params.id,
+        bucket: config.S3_QUARANTINE_BUCKET,
+        objectKey: media.quarantine_object_key,
+        event: "write",
+        actor: "api",
+        byteSize: actualBytes,
+        metadata: { source: "upload_complete" }
+      });
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "media.processing_requested",
@@ -149,6 +158,44 @@ export async function mediaRoutes(app: FastifyInstance) {
     if (!row) throw notFound("Media not found");
     if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
     return mediaResponse(row);
+  });
+
+  app.get("/media/:id/object-events", { preHandler: requireAuth }, async (request) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const media = await query<{ owner_id: string }>(
+      "SELECT owner_id FROM media_assets WHERE id = $1 AND deleted_at IS NULL",
+      [params.id]
+    );
+    const row = media.rows[0];
+    if (!row) throw notFound("Media not found");
+    if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
+    const events = await query<{
+      id: string;
+      bucket: string;
+      object_key: string;
+      event: string;
+      actor: string;
+      byte_size: string | null;
+      metadata: unknown;
+      created_at: Date;
+    }>(
+      `SELECT id, bucket, object_key, event, actor, byte_size, metadata, created_at
+       FROM media_object_events WHERE media_id = $1
+       ORDER BY created_at ASC LIMIT 200`,
+      [params.id]
+    );
+    return {
+      events: events.rows.map((event) => ({
+        id: event.id,
+        bucket: event.bucket,
+        objectKey: event.object_key,
+        event: event.event,
+        actor: event.actor,
+        byteSize: event.byte_size === null ? null : Number(event.byte_size),
+        metadata: event.metadata,
+        createdAt: event.created_at
+      }))
+    };
   });
 
   app.post("/media/:id/retry", { preHandler: requireVerifiedContributor }, async (request) => {
@@ -218,6 +265,7 @@ export async function mediaRoutes(app: FastifyInstance) {
 
     const publicKey = `media/${params.id}.webp`;
     const thumbnailKey = `media/${params.id}.thumb.webp`;
+    const publishedKeys = [publicKey, ...(media.thumbnail_object_key ? [thumbnailKey] : [])];
     try {
       await publishMediaObject(media.processed_object_key, publicKey);
       if (media.thumbnail_object_key) await publishMediaObject(media.thumbnail_object_key, thumbnailKey);
@@ -230,6 +278,16 @@ export async function mediaRoutes(app: FastifyInstance) {
            WHERE id = $1`,
           [params.id, publicKey, media.thumbnail_object_key ? thumbnailKey : null]
         );
+        for (const key of publishedKeys) {
+          await recordMediaObjectEvent(client, {
+            mediaId: params.id,
+            bucket: config.S3_PUBLIC_BUCKET,
+            objectKey: key,
+            event: "write",
+            actor: "api",
+            metadata: { source: "privacy_approved" }
+          });
+        }
         await recordAudit(client, {
           actorId: request.user!.id,
           action: "media.privacy_approved",
@@ -238,10 +296,21 @@ export async function mediaRoutes(app: FastifyInstance) {
         });
       });
     } catch (error) {
-      await Promise.allSettled([
-        deleteObject(config.S3_PUBLIC_BUCKET, publicKey),
-        media.thumbnail_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, thumbnailKey) : Promise.resolve()
-      ]);
+      const removals = await Promise.allSettled(
+        publishedKeys.map((key) => deleteObject(config.S3_PUBLIC_BUCKET, key))
+      );
+      await Promise.allSettled(
+        publishedKeys
+          .filter((_, index) => removals[index]?.status === "fulfilled")
+          .map((key) => recordMediaObjectEvent(pool, {
+            mediaId: params.id,
+            bucket: config.S3_PUBLIC_BUCKET,
+            objectKey: key,
+            event: "delete",
+            actor: "api",
+            metadata: { reason: "publish_rollback" }
+          }))
+      );
       throw error;
     }
 
@@ -293,14 +362,26 @@ export async function mediaRoutes(app: FastifyInstance) {
       });
     });
 
-    const removals = [
-      deleteObject(config.S3_QUARANTINE_BUCKET, media.quarantine_object_key),
-      media.processed_object_key ? deleteObject(config.S3_QUARANTINE_BUCKET, media.processed_object_key) : Promise.resolve(),
-      media.public_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, media.public_object_key) : Promise.resolve(),
-      media.public_thumbnail_object_key ? deleteObject(config.S3_PUBLIC_BUCKET, media.public_thumbnail_object_key) : Promise.resolve(),
-      media.thumbnail_object_key ? deleteObject(config.S3_QUARANTINE_BUCKET, media.thumbnail_object_key) : Promise.resolve()
+    const targets = [
+      { bucket: config.S3_QUARANTINE_BUCKET, key: media.quarantine_object_key },
+      ...(media.processed_object_key ? [{ bucket: config.S3_QUARANTINE_BUCKET, key: media.processed_object_key }] : []),
+      ...(media.public_object_key ? [{ bucket: config.S3_PUBLIC_BUCKET, key: media.public_object_key }] : []),
+      ...(media.public_thumbnail_object_key ? [{ bucket: config.S3_PUBLIC_BUCKET, key: media.public_thumbnail_object_key }] : []),
+      ...(media.thumbnail_object_key ? [{ bucket: config.S3_QUARANTINE_BUCKET, key: media.thumbnail_object_key }] : [])
     ];
-    await Promise.allSettled(removals);
+    const removals = await Promise.allSettled(targets.map((target) => deleteObject(target.bucket, target.key)));
+    await Promise.allSettled(
+      targets
+        .filter((_, index) => removals[index]?.status === "fulfilled")
+        .map((target) => recordMediaObjectEvent(pool, {
+          mediaId: params.id,
+          bucket: target.bucket,
+          objectKey: target.key,
+          event: "delete",
+          actor: "api",
+          metadata: { reason: "media_deleted" }
+        }))
+    );
     return { status: "deleted" };
   });
 }

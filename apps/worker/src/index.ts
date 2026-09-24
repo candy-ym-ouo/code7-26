@@ -3,6 +3,7 @@ import IORedis from "ioredis";
 import { config } from "./config";
 import { pool } from "./db";
 import { processMediaJob, cleanupOriginalMedia, cleanupDeletedMediaObjects, markStaleFeatures, recoverStuckMedia, markUnreferencedMediaDeleted } from "./media-job";
+import { reconcileMediaObjects } from "./media-reconcile";
 import { dispatchOutbox, recoverStuckOutbox } from "./outbox";
 import { purgeDeletedAccounts } from "./account-job";
 
@@ -61,6 +62,7 @@ async function maintenanceTick() {
     await cleanupOriginalMedia();
     await markUnreferencedMediaDeleted();
     await cleanupDeletedMediaObjects();
+    await reconcileMediaObjects();
     await markStaleFeatures();
     await purgeDeletedAccounts();
   } catch (error) {

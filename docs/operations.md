@@ -20,6 +20,7 @@
 - outbox `pending`、`failed` 数量。
 - `delete_after <= now()` 的原图数量。
 - 公开桶中是否存在未被数据库引用的对象。
+- `media_object_events` 中 `purge` 事件的速率（持续非零说明上游写入或清理路径有泄漏）。
 
 ## 备份
 

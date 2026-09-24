@@ -60,6 +60,7 @@
 | `GET` | `/media/:id/preview` | 审核员获取短期私有预览 |
 | `POST` | `/media/:id/privacy-approve` | 审核员确认隐私并发布派生图 |
 | `POST` | `/media/:id/retry` | 重试失败处理 |
+| `GET` | `/media/:id/object-events` | 查询对象写入、重试与清理台账（所有者或审核员） |
 | `DELETE` | `/media/:id` | 删除媒体对象 |
 
 ## 评论、举报和通知

@@ -1,5 +1,7 @@
 import type { PoolClient } from "pg";
 
+type Queryable = Pick<PoolClient, "query">;
+
 export async function recordAudit(
   client: PoolClient,
   input: {
@@ -18,6 +20,33 @@ export async function recordAudit(
       input.action,
       input.resourceType,
       input.resourceId ?? null,
+      JSON.stringify(input.metadata ?? {})
+    ]
+  );
+}
+
+export async function recordMediaObjectEvent(
+  client: Queryable,
+  input: {
+    mediaId: string | null;
+    bucket: string;
+    objectKey: string;
+    event: "write" | "rewrite" | "delete" | "adopt" | "purge";
+    actor: "api" | "worker" | "maintenance" | "reconcile";
+    byteSize?: number | null;
+    metadata?: Record<string, unknown>;
+  }
+): Promise<void> {
+  await client.query(
+    `INSERT INTO media_object_events(media_id, bucket, object_key, event, actor, byte_size, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+    [
+      input.mediaId,
+      input.bucket,
+      input.objectKey,
+      input.event,
+      input.actor,
+      input.byteSize ?? null,
       JSON.stringify(input.metadata ?? {})
     ]
   );

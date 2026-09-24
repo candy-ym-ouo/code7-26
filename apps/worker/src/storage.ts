@@ -3,6 +3,7 @@ import {
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client
 } from "@aws-sdk/client-s3";
@@ -59,4 +60,33 @@ export async function objectExists(bucket: string, key: string): Promise<boolean
 
 export async function deleteObject(bucket: string, key: string): Promise<void> {
   await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+}
+
+export type ListedObject = {
+  key: string;
+  lastModified: Date;
+  size: number;
+};
+
+export async function listObjects(bucket: string, prefix: string, maxObjects: number): Promise<ListedObject[]> {
+  const objects: ListedObject[] = [];
+  let continuationToken: string | undefined;
+  do {
+    const response = await s3.send(new ListObjectsV2Command({
+      Bucket: bucket,
+      Prefix: prefix,
+      MaxKeys: Math.min(1000, maxObjects - objects.length),
+      ContinuationToken: continuationToken
+    }));
+    for (const item of response.Contents ?? []) {
+      if (!item.Key) continue;
+      objects.push({
+        key: item.Key,
+        lastModified: item.LastModified ?? new Date(0),
+        size: Number(item.Size ?? 0)
+      });
+    }
+    continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+  } while (continuationToken && objects.length < maxObjects);
+  return objects;
 }

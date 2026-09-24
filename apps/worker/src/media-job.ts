@@ -4,6 +4,7 @@ import { pool } from "./db";
 import { deleteObject, objectExists, readQuarantineObject, writeQuarantineObject, copyToPublic } from "./storage";
 import { scanForMalware } from "./clamav";
 import { processPrivacyImage } from "./privacy";
+import { recordMediaObjectEvent } from "./media-ledger";
 
 export async function processMediaJob(mediaId: string): Promise<void> {
   const result = await pool.query<{
@@ -26,6 +27,7 @@ export async function processMediaJob(mediaId: string): Promise<void> {
   const autoPublish = Boolean(config.PRIVACY_DETECTOR_URL);
   const publicKey = `media/${mediaId}.webp`;
   const publicThumbnailKey = `media/${mediaId}.thumb.webp`;
+  const publishedKeys: string[] = [];
 
   try {
     await pool.query("UPDATE media_assets SET privacy_status = 'scanning', updated_at = now() WHERE id = $1", [mediaId]);
@@ -38,12 +40,59 @@ export async function processMediaJob(mediaId: string): Promise<void> {
 
     const processedKey = `processed/${mediaId}.webp`;
     const thumbnailKey = `processed/${mediaId}.thumb.webp`;
+    const processedExists = await objectExists(config.S3_QUARANTINE_BUCKET, processedKey);
+    const thumbnailExists = await objectExists(config.S3_QUARANTINE_BUCKET, thumbnailKey);
     await writeQuarantineObject(processedKey, processed.image, "image/webp");
+    await recordMediaObjectEvent({
+      mediaId,
+      bucket: config.S3_QUARANTINE_BUCKET,
+      objectKey: processedKey,
+      event: processedExists ? "rewrite" : "write",
+      actor: "worker",
+      byteSize: processed.image.length
+    });
     await writeQuarantineObject(thumbnailKey, processed.thumbnail, "image/webp");
+    await recordMediaObjectEvent({
+      mediaId,
+      bucket: config.S3_QUARANTINE_BUCKET,
+      objectKey: thumbnailKey,
+      event: thumbnailExists ? "rewrite" : "write",
+      actor: "worker",
+      byteSize: processed.thumbnail.length
+    });
+
+    // Persist the derived object keys before any further step so an
+    // interruption can never leave unreferenced objects in the bucket.
+    await pool.query(
+      `UPDATE media_assets
+       SET processed_object_key = $2, thumbnail_object_key = $3, updated_at = now()
+       WHERE id = $1`,
+      [mediaId, processedKey, thumbnailKey]
+    );
 
     if (autoPublish) {
       await copyToPublic(processedKey, publicKey);
+      publishedKeys.push(publicKey);
+      await recordMediaObjectEvent({
+        mediaId,
+        bucket: config.S3_PUBLIC_BUCKET,
+        objectKey: publicKey,
+        event: "write",
+        actor: "worker",
+        byteSize: processed.image.length,
+        metadata: { source: "auto_publish" }
+      });
       await copyToPublic(thumbnailKey, publicThumbnailKey);
+      publishedKeys.push(publicThumbnailKey);
+      await recordMediaObjectEvent({
+        mediaId,
+        bucket: config.S3_PUBLIC_BUCKET,
+        objectKey: publicThumbnailKey,
+        event: "write",
+        actor: "worker",
+        byteSize: processed.thumbnail.length,
+        metadata: { source: "auto_publish" }
+      });
     }
 
     const report = {
@@ -102,11 +151,20 @@ export async function processMediaJob(mediaId: string): Promise<void> {
        WHERE id = $1`,
       [mediaId, message]
     );
-    if (autoPublish) {
-      await Promise.allSettled([
-        deleteObject(config.S3_PUBLIC_BUCKET, publicKey),
-        deleteObject(config.S3_PUBLIC_BUCKET, publicThumbnailKey)
-      ]);
+    for (const key of publishedKeys) {
+      try {
+        await deleteObject(config.S3_PUBLIC_BUCKET, key);
+        await recordMediaObjectEvent({
+          mediaId,
+          bucket: config.S3_PUBLIC_BUCKET,
+          objectKey: key,
+          event: "delete",
+          actor: "worker",
+          metadata: { reason: "processing_failed" }
+        });
+      } catch (cleanupError) {
+        console.error({ mediaId, key, cleanupError }, "failed to roll back published media object");
+      }
     }
     throw error;
   }
@@ -124,6 +182,14 @@ export async function cleanupOriginalMedia(): Promise<void> {
     try {
       if (await objectExists(config.S3_QUARANTINE_BUCKET, row.quarantine_object_key)) {
         await deleteObject(config.S3_QUARANTINE_BUCKET, row.quarantine_object_key);
+        await recordMediaObjectEvent({
+          mediaId: row.id,
+          bucket: config.S3_QUARANTINE_BUCKET,
+          objectKey: row.quarantine_object_key,
+          event: "delete",
+          actor: "maintenance",
+          metadata: { reason: "abandoned_upload" }
+        });
       }
       await pool.query(
         `UPDATE media_assets
@@ -147,6 +213,14 @@ export async function cleanupOriginalMedia(): Promise<void> {
     try {
       if (await objectExists(config.S3_QUARANTINE_BUCKET, row.quarantine_object_key)) {
         await deleteObject(config.S3_QUARANTINE_BUCKET, row.quarantine_object_key);
+        await recordMediaObjectEvent({
+          mediaId: row.id,
+          bucket: config.S3_QUARANTINE_BUCKET,
+          objectKey: row.quarantine_object_key,
+          event: "delete",
+          actor: "maintenance",
+          metadata: { reason: "retention_expired" }
+        });
       }
       await pool.query("UPDATE media_assets SET delete_after = NULL, updated_at = now() WHERE id = $1", [row.id]);
     } catch (error) {
@@ -198,15 +272,25 @@ export async function cleanupDeletedMediaObjects(): Promise<void> {
 
   for (const item of result.rows) {
     try {
-      const removals: Array<Promise<void>> = [];
+      const targets: Array<{ bucket: string; key: string }> = [];
       if (!item.quarantine_object_key.startsWith("deleted/")) {
-        removals.push(deleteObject(config.S3_QUARANTINE_BUCKET, item.quarantine_object_key));
+        targets.push({ bucket: config.S3_QUARANTINE_BUCKET, key: item.quarantine_object_key });
       }
-      if (item.processed_object_key) removals.push(deleteObject(config.S3_QUARANTINE_BUCKET, item.processed_object_key));
-      if (item.thumbnail_object_key) removals.push(deleteObject(config.S3_QUARANTINE_BUCKET, item.thumbnail_object_key));
-      if (item.public_object_key) removals.push(deleteObject(config.S3_PUBLIC_BUCKET, item.public_object_key));
-      if (item.public_thumbnail_object_key) removals.push(deleteObject(config.S3_PUBLIC_BUCKET, item.public_thumbnail_object_key));
-      await Promise.all(removals);
+      if (item.processed_object_key) targets.push({ bucket: config.S3_QUARANTINE_BUCKET, key: item.processed_object_key });
+      if (item.thumbnail_object_key) targets.push({ bucket: config.S3_QUARANTINE_BUCKET, key: item.thumbnail_object_key });
+      if (item.public_object_key) targets.push({ bucket: config.S3_PUBLIC_BUCKET, key: item.public_object_key });
+      if (item.public_thumbnail_object_key) targets.push({ bucket: config.S3_PUBLIC_BUCKET, key: item.public_thumbnail_object_key });
+      await Promise.all(targets.map((target) => deleteObject(target.bucket, target.key)));
+      for (const target of targets) {
+        await recordMediaObjectEvent({
+          mediaId: item.id,
+          bucket: target.bucket,
+          objectKey: target.key,
+          event: "delete",
+          actor: "maintenance",
+          metadata: { reason: "media_deleted" }
+        });
+      }
 
       await pool.query(
         `UPDATE media_assets

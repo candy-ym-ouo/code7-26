@@ -21,6 +21,7 @@ const envSchema = z.object({
   PRIVACY_BLUR_SIGMA: z.coerce.number().positive().default(32),
   PRIVACY_BLUR_PADDING: z.coerce.number().min(0).max(0.5).default(0.08),
   ORIGINAL_RETENTION_HOURS: z.coerce.number().positive().default(24),
+  MEDIA_ORPHAN_GRACE_MINUTES: z.coerce.number().positive().default(60),
   CLAMAV_ENABLED: z.string().default("true").transform((value) => value === "true"),
   CLAMAV_HOST: z.string().default("localhost"),
   CLAMAV_PORT: z.coerce.number().int().positive().default(3310),
